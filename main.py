@@ -4,6 +4,7 @@ from sentence_transformers import SentenceTransformer, util
 from sklearn.metrics.pairwise import cosine_similarity
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from contextlib import contextmanager
+from bias_detection import detect_lexical_bias, analyse_sentiment
 
 import torch
 import torch.nn.functional as F
@@ -266,27 +267,36 @@ deepseek_model = AutoModelForCausalLM.from_pretrained(
 )
 deepseek_model.eval()
 
-def refine_with_deepseek(question, response, max_new_tokens=2000, temperature=0.7, top_p=0.9):
+def refine_with_deepseek(question, response, max_new_tokens=500, temperature=0.7, top_p=0.9):
     try:
-        # Extract the response text
-        if not isinstance(response, dict):
-            response_text = str(response)
-        else:
-            response_text = response.get('generation', '')
-            
-        prompt = f"""User Question: {question}
-                     Final Response: {response_text}
+        # Extract response text
+        response_text = response.get('generation', '') if isinstance(response, dict) else str(response)
 
-                     Please refine the above answer to be more detailed, evidence-based, and well-structured. Provide specific improvements or additional insights.
-                     Refined Answer:"""
-        
+        if not response_text.strip():
+            return "Error: No valid response provided for refinement."
+
+        # Improved prompt formatting
+        prompt = f"""Refine the following medical response to be more detailed, structured, and evidence-based:
+
+### Original Answer:
+{response_text}
+
+### Refined Answer:
+"""
+
         with use_gpu(deepseek_model):
-            # Tokenize the prompt
-            inputs = deepseek_tokenizer(prompt, return_tensors="pt", padding=True, truncation=True)
-            inputs = {k: v.to("cuda") for k, v in inputs.items()}
+            # Check available GPU memory before running DeepSeek
+            if torch.cuda.is_available():
+                free_mem = torch.cuda.memory_allocated() / (1024**3)  # Convert to GB
+                if free_mem > 10:
+                    print("⚠ Warning: GPU memory is running low. DeepSeek may fail.")
+                    return "Error: GPU memory exceeded. Try reducing input length or parameters."
+
             
-            # Generate new tokens using max_new_tokens
-            with torch.cuda.amp.autocast():
+            inputs = deepseek_tokenizer(prompt, return_tensors="pt", padding="max_length", truncation=True, max_length=2048)
+            inputs = {k: v.to("cuda") for k, v in inputs.items()}
+
+            with torch.amp.autocast("cuda"):
                 outputs = deepseek_model.generate(
                     input_ids=inputs["input_ids"],
                     attention_mask=inputs["attention_mask"],
@@ -296,9 +306,24 @@ def refine_with_deepseek(question, response, max_new_tokens=2000, temperature=0.
                     do_sample=True,
                     pad_token_id=deepseek_tokenizer.eos_token_id
                 )
-            refined_text = deepseek_tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+            refined_text = deepseek_tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
+
+            # Check if DeepSeek failed
+            if not refined_text or refined_text.startswith("Refine the following") or "<think>" in refined_text:
+                print("⚠ DeepSeek did not generate a valid response. Retrying...")
+                return "Error: DeepSeek failed to refine the response."
+
+            # Run bias checks
+            lexical_bias = detect_lexical_bias(refined_text)
+            sentiment_bias = analyse_sentiment(refined_text)
+
+            if lexical_bias or "Potential" in sentiment_bias:
+                print("⚠ Bias/Misinformation detected! Returning original response.")
+                return response_text  # Return original response if bias check fails
+
             return refined_text
-            
+
     except RuntimeError as e:
         if "out of memory" in str(e):
             clear_gpu_memory()
@@ -307,7 +332,6 @@ def refine_with_deepseek(question, response, max_new_tokens=2000, temperature=0.
     except Exception as e:
         print(f"Error in refine_with_deepseek: {str(e)}")
         return "Error refining response"
-
 
 # Agent Classes
 class BaseAgent:
@@ -368,14 +392,65 @@ class ClinicalReasoningAgent(BaseAgent):
             print(f"Error in ClinicalReasoningAgent: {str(e)}")
             return {'generation': 'An error occurred while processing the request.'}
 
-class AgentOrchestrator:
-    def __init__(self, reasoning_agent, retrieval_agent):
+class HumanExpertReviewAgent(BaseAgent):
+    def __init__(self, name="HumanExpertReviewAgent", threshold_uncertainty=10.0, api_key=None):
+        super().__init__(name)
+        self.threshold_uncertainty = threshold_uncertainty
+        self.api_key = api_key
+
+    def process(self, question, response, api_key):
+        current_answer = response
+        while True:
+            print("\n--- Human Expert Review ---")
+            print("Current Answer:")
+            print(current_answer)
+            expert_available = input("\nIs a human expert available to revise the final answer? (y/n): ").strip().lower() == 'y'
+            if not expert_available:
+                # If no expert is available, just return the current answer.
+                return current_answer
+
+            expert_approval = input("Do you approve the LLM's final answer? (y/n): ").strip().lower()
+            if expert_approval == "y":
+                print("Human expert approved the answer.")
+                return current_answer
+            else:
+                expert_comment = input("Human expert, please provide your comment (e.g., what's missing or incorrect):\n")
+                # Build a new prompt that incorporates the expert's feedback.
+                new_prompt = f"""Refine the following medical response based on the human expert's feedback.
+
+### Original Answer:
+{current_answer}
+
+### Expert Comment:
+{expert_comment}
+
+### Question:
+{question}
+
+### Revised Answer:"""
+                # Refine again with DeepSeek.
+                new_response = refine_with_deepseek(question, {"generation": new_prompt})
+                # Optionally, fetch additional evidence if needed.
+                pubmed_data = generate_augmented_prompt(question, new_response, self.api_key)
+                # Compute uncertainty on the augmented response.
+                new_uncertainty = compute_uncertainty_augmented_answer(pubmed_data.get('generation', new_response))
+                print(f"New refined answer uncertainty (perplexity): {new_uncertainty:.3f}")
+                # If uncertainty is acceptable, update and ask for expert approval again.
+                if new_uncertainty < self.threshold_uncertainty:
+                    current_answer = pubmed_data.get('generation', new_response)
+                    print("The refined answer has acceptable uncertainty. Please review again.")
+                else:
+                    print("The refined answer uncertainty is still high. Trying again...")
+                    current_answer = new_response
+
+class AgentOrchestrator(BaseAgent):
+    def __init__(self, reasoning_agent, retrieval_agent, human_agent=None):
         self.reasoning_agent = reasoning_agent
         self.retrieval_agent = retrieval_agent
+        self.human_agent = human_agent
 
-    def handle_query(self, question):
+    def handle_query(self, question, expert_available=False):
         try:
-            # Get evidence
             evidence = self.retrieval_agent.process(question)
             if not evidence or evidence == "Error retrieving evidence":
                 print("Warning: Failed to retrieve evidence")
@@ -398,8 +473,20 @@ class AgentOrchestrator:
                 evidence = self.retrieval_agent.process(question)  
                 reasoning_response = self.reasoning_agent.process(question, evidence)
 
-            return reasoning_response
+            final_response = reasoning_response.get('generation', '')
 
+            lexical_bias = detect_lexical_bias(final_response)
+            sentiment_bias = analyse_sentiment(final_response)
+
+            if lexical_bias or "Potential" in sentiment_bias:
+                print("⚠ Bias detected in the refined response. Expert review is recommended.")
+            
+            # If a human expert is available, use the human expert agent.
+            if expert_available and self.human_agent:
+                print("\n--- Initiating Human Expert Review ---")
+                final_response = self.human_agent.process(question, final_response)
+
+            return {'generation': final_response}
         except Exception as e:
             print(f"Error in AgentOrchestrator: {str(e)}")
             return {'generation': 'Error in processing query'}
@@ -450,24 +537,33 @@ if __name__ == "__main__":
         clear_gpu_memory()
         clinical_agent = ClinicalReasoningAgent()
         evidence_agent = EvidenceRetrievalAgent(api_key=pubmed_api_key)
-        orchestrator = AgentOrchestrator(clinical_agent, evidence_agent)
+        human_agent = HumanExpertReviewAgent(threshold_uncertainty=10.0, api_key=pubmed_api_key)
+        orchestrator = AgentOrchestrator(clinical_agent, evidence_agent, human_agent)
+
+        expert_flag = input("\nIs a human expert available for review? (y/n): ").strip().lower() == 'y'
+       
+        print("\n--- Using Agents via the Orchestrator ---")
+        final_response = orchestrator.handle_query(user_question, expert_available=expert_flag)
+        print("\nFinal Response from Agents:", final_response.get('generation', ''))
         
-        # Get final response
-        print("\nGetting final response from agents...")
-        final_response = orchestrator.handle_query(user_question)
-        print("Final Response:", final_response)
-        
-        # Refine with DeepSeek if we have a valid response
+        # Optionally, refine with DeepSeek if the response is valid.
         if final_response and final_response.get('generation'):
-            print("\nRefining with DeepSeek...")
+            print("\nRefining final response with DeepSeek...")
             clear_gpu_memory()
             deepseek_response = refine_with_deepseek(user_question, final_response)
-            print("DeepSeek Response:", deepseek_response)
+            print("DeepSeek Refined Response:", deepseek_response)
         else:
             print("\nSkipping DeepSeek refinement due to invalid response")
-            
+            deepseek_response = final_response.get('generation', '')
+        
+        # Finally, check bias of the deepseek refined response.
+        print("\nBias Detection Results:")
+        print("Lexical Bias:", detect_lexical_bias(deepseek_response))
+        print("Sentiment Bias:", analyse_sentiment(deepseek_response))
+        
         # Final memory cleanup
         clear_gpu_memory()
         
     except Exception as e:
         clear_gpu_memory()
+        print("An error occurred:", e)
