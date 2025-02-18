@@ -5,6 +5,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from contextlib import contextmanager
 from bias_detection import detect_lexical_bias, analyse_sentiment
+from datetime import datetime
 
 import torch
 import torch.nn.functional as F
@@ -13,6 +14,7 @@ import requests
 import xml.etree.ElementTree as ET
 import os
 import gc
+import json 
 
 # Memory management configuration
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:512,expandable_segments:True'
@@ -56,6 +58,15 @@ def use_gpu(model):
     finally:
         model.to("cpu")
         clear_gpu_memory()
+
+def save_result_to_json(results):
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    filename = f"/content/drive/MyDrive/MedAI/output_{timestamp}.json"
+
+    with open(filename, "w") as json_file:
+         json.dump(results, json_file, indent=4)
+    print(f"Results saved to {filename}")
+
 
 def format_few_shot_prompt(question):
     few_shot_examples = """
@@ -457,7 +468,6 @@ class AgentOrchestrator(BaseAgent):
                 evidence = "No evidence available"
 
             # Get reasoning response
-            reasoning_response = self.retrieval_agent.process(question)  # Use evidence if needed
             reasoning_response = self.reasoning_agent.process(question, evidence)
             if not reasoning_response or not reasoning_response.get('generation'):
                 print("Warning: Failed to generate reasoning response")
@@ -532,6 +542,18 @@ if __name__ == "__main__":
         uncertainty_entropy = compute_uncertainty_augmented_answer(augmented_answer.get('generation', ''))
         print(f"Perplexity (Uncertainty): {uncertainty_entropy:.3f}")
         
+        results = {
+            "User Question": user_question,
+            "Base Response": base_response,
+            "Relevance Score": float(relevance_score),
+            "Pairwise similarity": float(avg_sim),
+            "Standard deviation": float(std_sim),
+            "Augmented Response": augmented_answer,
+            "Perplexity": float(uncertainty_entropy),
+        }
+        save_result_to_json(results)
+
+
         # Use agents via orchestrator
         print("\n--- Using Agents via the Orchestrator ---")
         clear_gpu_memory()
@@ -539,31 +561,62 @@ if __name__ == "__main__":
         evidence_agent = EvidenceRetrievalAgent(api_key=pubmed_api_key)
         human_agent = HumanExpertReviewAgent(threshold_uncertainty=10.0, api_key=pubmed_api_key)
         orchestrator = AgentOrchestrator(clinical_agent, evidence_agent, human_agent)
+        
+        clinical_response = clinical_agent.process(
+        question=user_question,
+        evidence=augmented_answer.get('generation', '')
+        )
+        print("\nClinical Agent Response:")
+        print(clinical_response.get('generation', ''))
+
+        # Optionally, you can also retrieve extra evidence with the evidence agent.
+        additional_evidence = evidence_agent.process(user_question)
+        print("\nAdditional Evidence Retrieved:")
+        print(additional_evidence)
+
+        # Combine the clinical response and any additional evidence if desired.
+        combined_response_text = (
+            f"{clinical_response.get('generation', '')}\n\nAdditional Evidence:\n{additional_evidence}"
+        )
+
+        deepseek_refined_response = refine_with_deepseek(
+        question=user_question,
+        response={"generation": combined_response_text},
+        max_new_tokens=500, 
+        temperature=0.7,
+        top_p=0.9
+        )
+        print("\nDeepSeek Refined Response:")
+        print(deepseek_refined_response)
 
         expert_flag = input("\nIs a human expert available for review? (y/n): ").strip().lower() == 'y'
-       
+
+        clear_gpu_memory()
+        if expert_flag:  # expert_flag is set based on user input.
+            final_response = human_agent.process(
+                question=user_question,
+                response=deepseek_refined_response,
+                api_key=pubmed_api_key
+            )
+            print("\nFinal Response after Human Expert Review:")
+            print(final_response)
+        else:
+            final_response = deepseek_refined_response
+            print("\nFinal Response (No Human Expert Review):")
+            print(final_response)
+
         print("\n--- Using Agents via the Orchestrator ---")
         final_response = orchestrator.handle_query(user_question, expert_available=expert_flag)
         print("\nFinal Response from Agents:", final_response.get('generation', ''))
         
-        # Optionally, refine with DeepSeek if the response is valid.
-        if final_response and final_response.get('generation'):
-            print("\nRefining final response with DeepSeek...")
-            clear_gpu_memory()
-            deepseek_response = refine_with_deepseek(user_question, final_response)
-            print("DeepSeek Refined Response:", deepseek_response)
-        else:
-            print("\nSkipping DeepSeek refinement due to invalid response")
-            deepseek_response = final_response.get('generation', '')
-        
         # Finally, check bias of the deepseek refined response.
         print("\nBias Detection Results:")
-        print("Lexical Bias:", detect_lexical_bias(deepseek_response))
-        print("Sentiment Bias:", analyse_sentiment(deepseek_response))
+        print("Lexical Bias:", detect_lexical_bias(final_response))
+        print("Sentiment Bias:", analyse_sentiment(final_response))
         
         # Final memory cleanup
         clear_gpu_memory()
-        
+
     except Exception as e:
         clear_gpu_memory()
         print("An error occurred:", e)
