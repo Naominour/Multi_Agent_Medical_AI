@@ -3,8 +3,6 @@
 It is powered by **3 AI Agents**, **Evidence Retrieval AI Agent**, **Clinical Reasoning AI Agent**, **Uncertainty & Refinement AI Agent**, and features **Human-in-the-Loop (HITL) Review** for ensuring reliability and reducing AI bias.
 
 
-![MedAI System Overview](https://user-images.githubusercontent.com/12345678/medai-banner.png)
-
 ---
 ## 🔥 What's Special About MedAI?
 ✅ **Fine-Tuned LLaMA & DeepSeek on 20,000+ Medical Data Points** 📊  
@@ -12,7 +10,8 @@ It is powered by **3 AI Agents**, **Evidence Retrieval AI Agent**, **Clinical Re
    - Ensures **high-quality, expert-verified medical answers**.  
 
 📌 **GitHub Link to Fine-Tuned Models:**  
-🔗 **[Fine-Tuned LLaMA & DeepSeek Model](https://github.com/your-finetuned-models-repo)**  
+🔗 **[Fine-Tuned LLaMA 3.1 Model](https://github.com/Naominour/Fine_Tuning_LLaMA_Model)**  
+🔗 **[Fine-Tuned DeepSeek R1 Model](https://github.com/Naominour/Fine-tuning-DeepSeek-R1)**  
 
 ---
 
@@ -81,19 +80,19 @@ Once dependencies and models are set up, run:
 python main.py
 ```
 
-# ✅ Example Input:
+## ✅ Example Input:
 ```bash
 Enter your medical question: What are the early signs of Alzheimer's disease?
 Is a human expert available for review? (y/n): y
 ```
-# ✅ Example Output:
+## ✅ Example Output:
 ```bash
 {
   "User Question": "What are the early signs of Alzheimer's disease?",
   "Final Response": "Early signs of Alzheimer's include memory loss, confusion, difficulty in problem-solving, and changes in mood or personality."
 }
 ```
-# ✅ Response saved in: data/output/result.json
+## ✅ Response saved in: data/output/result.json
 
 ---
 
