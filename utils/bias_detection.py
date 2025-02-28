@@ -7,7 +7,6 @@ BIAS_TERMS = {
 }
 
 def detect_lexical_bias(response):
-    """Identifies absolute and sensationalist claims."""
     bias_report = {}
     for category, terms in BIAS_TERMS.items():
         found_terms = [term for term in terms if re.search(r'\b' + term + r'\b', response, re.IGNORECASE)]
@@ -16,7 +15,7 @@ def detect_lexical_bias(response):
     return bias_report if bias_report else "No major lexical bias detected"
 
 def analyse_sentiment(response):
-    """Detects sentiment bias in the response."""
+    # Detects sentiment bias in the response.
     analysis = TextBlob(response)
     sentiment_score = analysis.sentiment.polarity
     if sentiment_score < -0.3:
