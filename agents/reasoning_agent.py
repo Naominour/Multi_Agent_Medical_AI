@@ -15,7 +15,7 @@ class ClinicalReasoningAgent(BaseAgent):
                 prompt += f"Evidence:\n{evidence}\n"
 
             prompt += """Let's reason through the problem step by step:
-            Step 1: Analyze the question and evidence
+            Step 1: Analyse the question and evidence
             Step 2: Identify key medical concepts
             Step 3: Form a structured response
 
